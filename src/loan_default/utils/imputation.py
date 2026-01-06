@@ -73,5 +73,7 @@ def categorical_missing(
 
     draws = rng.multinomial(1, probabilities, size=len(missing_idx))
     sampled = [values[row.argmax()] for row in draws]
-    data.loc[missing_idx, column] = sampled
+    # Use iloc to avoid label-based KeyError when indices are not 0..n
+    col_pos = data.columns.get_loc(column)
+    data.iloc[missing_idx, col_pos] = sampled
     return data

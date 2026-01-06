@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from typing import Iterable, Sequence
+import re
+import tempfile
 
 import mlflow
 import mlflow.sklearn
@@ -14,6 +16,7 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_a
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler
+import re
 
 
 def train_test_splits(
@@ -55,6 +58,25 @@ def build_preprocessor(numeric_features: Sequence[str]) -> ColumnTransformer:
     return ColumnTransformer(transformers=[("num", numeric_transformer, numeric_features)])
 
 
+def next_experiment_name(prefix: str = "loan-default-exp", width: int = 3) -> str:
+    """Return the next experiment name by incrementing the numeric suffix if present."""
+
+    experiments = mlflow.search_experiments()
+    pattern = re.compile(rf"{re.escape(prefix)}[-_]?(\d+)$")
+    max_num = 0
+
+    for exp in experiments:
+        if not exp.name.startswith(prefix):
+            continue
+        match = pattern.search(exp.name)
+        if match:
+            max_num = max(max_num, int(match.group(1)))
+        elif exp.name == prefix:
+            max_num = max(max_num, 0)
+
+    return f"{prefix}-{max_num + 1:0{width}d}"
+
+
 def mlflow_models(
     flows: list[list],
     train_with_dummies: pd.DataFrame,
@@ -64,7 +86,11 @@ def mlflow_models(
     numeric_features: Sequence[str],
     cv: int = 7,
     scoring: list[str] | None = None,
-    verbose: int = 4,
+    verbose: int = 3,
+    experiment_name: str = "loan-default-exp",
+    tracking_uri: str | None = None,
+    experiment_name_autoincrement: bool = False,
+    experiment_name_width: int = 3,
 ) -> None:
     """Grid-search multiple models and log results with mlflow.
 
@@ -77,14 +103,24 @@ def mlflow_models(
 
     names, models, use_dummies_flags, param_grids = flows
 
+    mlflow.set_tracking_uri(tracking_uri)
+
+    if experiment_name_autoincrement:
+        experiment_name = next_experiment_name(prefix=experiment_name, width=experiment_name_width)
+
     for run_idx, (name, model, use_dummies, params) in enumerate(
         zip(names, models, use_dummies_flags, param_grids), start=1
     ):
-        mlflow.set_experiment(name)
-        with mlflow.start_run():
+        mlflow.set_experiment(experiment_name)
+        with mlflow.start_run(run_name=name):
             mlflow.set_tag("Model", name)
+            mlflow.set_tag("RunIndex", run_idx)
             mlflow.log_param("PreSplit", True)
-            mlflow.set_experiment_tag("ExpID", f"{name}.run_{run_idx}")
+            mlflow.log_param("UseDummies", bool(use_dummies))
+            mlflow.log_param("CVFolds", cv)
+            mlflow.log_param("Scoring", ",".join(scoring))
+            mlflow.set_experiment_tag("ExpID", f"{experiment_name}.{name}.run_{run_idx}")
+            mlflow.set_tag("NumericFeatures", ",".join(numeric_features))
 
             dataset_train = train_with_dummies.copy() if use_dummies else train_without_dummies.copy()
             dataset_test = test_with_dummies.copy() if use_dummies else test_without_dummies.copy()
@@ -110,6 +146,8 @@ def mlflow_models(
 
             grid.fit(X_train, y_train)
             mlflow.log_params(grid.best_params_)
+            mlflow.log_metric("CVBestScore", grid.best_score_)
+            mlflow.log_param("RefitMetric", grid.refit)
             best_model = grid.best_estimator_
 
             y_train_pred = best_model.predict(X_train)
@@ -117,5 +155,11 @@ def mlflow_models(
 
             mlflow_metrics(y_train, y_train_pred, y_test, y_test_pred)
 
+            # Log full CV results as an artifact for inspection.
+            cv_df = pd.DataFrame(grid.cv_results_)
+            with tempfile.NamedTemporaryFile(suffix="_cv_results.csv", delete=False) as tmp:
+                cv_df.to_csv(tmp.name, index=False)
+                mlflow.log_artifact(tmp.name, artifact_path="cv_results")
+
             signature = infer_signature(model_input=X_train, model_output=y_test_pred)
-            mlflow.sklearn.log_model(best_model, artifact_path="model", signature=signature)
+            mlflow.sklearn.log_model(best_model, name="model", signature=signature)
